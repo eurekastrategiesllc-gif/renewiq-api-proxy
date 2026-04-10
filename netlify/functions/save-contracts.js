@@ -23,7 +23,6 @@ exports.handler = async (event) => {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'teamDomain and userEmail required' }) };
     }
 
-    // Validate that the user's email domain matches the team domain
     const emailDomain = userEmail.split('@')[1]?.toLowerCase();
     if (emailDomain !== teamDomain.toLowerCase()) {
       return { statusCode: 403, headers, body: JSON.stringify({ error: 'Domain mismatch' }) };
@@ -33,7 +32,9 @@ exports.handler = async (event) => {
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'contracts must be an array' }) };
     }
 
-    const store = getStore('renewiq-contracts');
+    const siteID = process.env.BLOB_SITE_ID || process.env.SITE_ID;
+    const token = process.env.BLOB_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+    const store = getStore({ name: 'renewiq-contracts', siteID, token });
     const key = `team_${teamDomain.toLowerCase()}`;
 
     await store.setJSON(key, {
