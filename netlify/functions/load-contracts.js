@@ -30,7 +30,9 @@ exports.handler = async (event) => {
       return { statusCode: 403, headers, body: JSON.stringify({ error: 'Domain mismatch' }) };
     }
 
-    const store = getStore('renewiq-contracts');
+    const siteID = process.env.BLOB_SITE_ID || process.env.SITE_ID;
+    const token = process.env.BLOB_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+    const store = getStore({ name: 'renewiq-contracts', siteID, token });
     const key = `team_${teamDomain.toLowerCase()}`;
 
     const data = await store.get(key, { type: 'json' });
