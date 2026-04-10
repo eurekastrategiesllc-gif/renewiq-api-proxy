@@ -1,12 +1,15 @@
+const crypto = require('crypto');
+
 exports.handler = async (event) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS'
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Content-Type': 'application/json'
   };
 
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 200, headers, body: '' };
+    return { statusCode: 204, headers, body: '' };
   }
 
   if (event.httpMethod !== 'POST') {
@@ -14,91 +17,124 @@ exports.handler = async (event) => {
   }
 
   try {
-    const { email, role, message, inviterName } = JSON.parse(event.body);
+    const { email, role, message, inviterName, inviterEmail } = JSON.parse(event.body);
 
     if (!email || !email.includes('@')) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Valid email required' }) };
+    }
+
+    if (!inviterEmail || !inviterEmail.includes('@')) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Inviter email required' }) };
+    }
+
+    // Domain validation: invited email domain must match inviter's domain
+    const invitedDomain = email.split('@')[1].toLowerCase();
+    const inviterDomain = inviterEmail.split('@')[1].toLowerCase();
+
+    if (invitedDomain !== inviterDomain) {
       return {
         statusCode: 400,
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Valid email address is required' })
+        headers,
+        body: JSON.stringify({
+          error: `Domain mismatch: invited email must use @${inviterDomain}`
+        })
       };
     }
 
     const resendKey = process.env.RESEND_API_KEY;
-    const fromEmail = process.env.RESEND_FROM_EMAIL || 'ReNewIQ <noreply@renewiq.io>';
-
     if (!resendKey) {
-      return {
-        statusCode: 500,
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Email service not configured' })
-      };
+      return { statusCode: 500, headers, body: JSON.stringify({ error: 'Email service not configured' }) };
     }
 
+    const fromEmail = process.env.RESEND_FROM_EMAIL || 'ReNewIQ <noreply@renewiq.io>';
     const roleName = { viewer: 'Viewer', editor: 'Editor', manager: 'Manager', admin: 'Admin' }[role] || 'Manager';
-    const signupLink = 'https://renewiq.io';
     const sender = inviterName || 'Your team';
-    const personalNote = message
-      ? '<p style="margin:20px 0;padding:16px 20px;background:#f8f6f0;border-left:3px solid #c9a84c;border-radius:0 8px 8px 0;color:#1a3352;font-size:14px;line-height:1.6;font-style:italic">&ldquo;' + message + '&rdquo;</p>'
-      : '';
 
-    const htmlBody = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>'
-      + '<body style="margin:0;padding:0;background:#edf1f8;font-family:Helvetica Neue,Arial,sans-serif">'
-      + '<div style="max-width:560px;margin:0 auto;padding:40px 20px">'
-      + '<div style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(13,27,42,0.08)">'
-      + '<div style="background:#0d1b2a;padding:32px 36px;text-align:center">'
-      + '<h1 style="margin:0;font-family:Georgia,Playfair Display,serif;color:#c9a84c;font-size:28px;font-weight:700;letter-spacing:0.5px">ReNewIQ</h1>'
-      + '<p style="margin:6px 0 0;font-size:10px;letter-spacing:3px;text-transform:uppercase;color:rgba(201,168,76,0.5)">Contract Intelligence</p>'
-      + '</div>'
-      + '<div style="padding:36px">'
-      + '<h2 style="margin:0 0 8px;color:#0d1b2a;font-size:20px;font-weight:600">You have been invited!</h2>'
-      + '<p style="margin:0 0 20px;color:#7a93ae;font-size:14px;line-height:1.6">' + sender + ' has invited you to join their team on ReNewIQ as a <strong style="color:#0d1b2a">' + roleName + '</strong>.</p>'
-      + personalNote
-      + '<p style="margin:20px 0;color:#7a93ae;font-size:14px;line-height:1.6">ReNewIQ helps teams track, analyze, and optimize their contract renewals with AI-powered insights.</p>'
-      + '<div style="text-align:center;margin:28px 0">'
-      + '<a href="' + signupLink + '" style="display:inline-block;background:#c9a84c;color:#0d1b2a;text-decoration:none;padding:14px 36px;border-radius:8px;font-weight:600;font-size:15px;letter-spacing:0.3px">Accept Invitation &rarr;</a>'
-      + '</div>'
-      + '<div style="margin-top:28px;padding-top:20px;border-top:1px solid #e8ecf2">'
-      + '<p style="margin:0;color:#7a93ae;font-size:12px;line-height:1.5;text-align:center">This invitation expires in 7 days. If you did not expect this email, you can safely ignore it.</p>'
-      + '</div></div></div>'
-      + '<p style="text-align:center;margin:20px 0 0;color:#7a93ae;font-size:11px">&copy; ' + new Date().getFullYear() + ' ReNewIQ &mdash; Contract Intelligence Platform</p>'
-      + '</div></body></html>';
+    // Generate invite token: base64-encoded JSON with expiry and HMAC signature
+    const inviteData = {
+      email: email.toLowerCase(),
+      role: role || 'manager',
+      domain: inviterDomain,
+      inviterEmail: inviterEmail.toLowerCase(),
+      exp: Date.now() + (7 * 24 * 60 * 60 * 1000) // 7 day expiry
+    };
 
-    const res = await fetch('https://api.resend.com/emails', {
+    // Sign the invite data with a secret (use RESEND_API_KEY as HMAC key for simplicity)
+    const payload = Buffer.from(JSON.stringify(inviteData)).toString('base64url');
+    const sig = crypto.createHmac('sha256', resendKey).update(payload).digest('base64url');
+    const token = payload + '.' + sig;
+
+    const signupLink = `https://renewiq.io/?invite=${encodeURIComponent(token)}`;
+
+    const emailHtml = `
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #0d1b2a; border-radius: 12px; overflow: hidden;">
+      <div style="padding: 40px 32px 24px; text-align: center;">
+        <div style="font-size: 28px; font-weight: 700; color: #c9a84c; font-family: 'Georgia', serif;">
+          ReNew<span style="color: rgba(122,147,174,0.6);">IQ</span>
+        </div>
+        <div style="color: rgba(122,147,174,0.5); font-size: 10px; letter-spacing: 3px; text-transform: uppercase; margin-top: 4px;">
+          Contract Intelligence Platform
+        </div>
+      </div>
+      <div style="padding: 0 32px 32px;">
+        <div style="background: #1a3352; border-radius: 8px; padding: 32px; border: 1px solid rgba(201,168,76,0.15);">
+          <h2 style="color: #f4f7fb; font-size: 20px; margin: 0 0 16px;">You're invited to join ReNewIQ</h2>
+          <p style="color: #7a93ae; font-size: 15px; line-height: 1.6; margin: 0 0 16px;">
+            <strong style="color: #c9a84c;">${sender}</strong> has invited you to join their team on ReNewIQ as a <strong style="color: #f4f7fb;">${roleName}</strong>.
+          </p>
+          ${message ? `<p style="color: #7a93ae; font-size: 14px; line-height: 1.5; margin: 0 0 16px; padding: 12px; background: rgba(201,168,76,0.08); border-radius: 6px; border-left: 3px solid #c9a84c;">"${message}"</p>` : ''}
+          <p style="color: #7a93ae; font-size: 14px; line-height: 1.5; margin: 0 0 24px;">
+            Click below to create your account and get started. Your team subscription covers your access \u2014 no payment needed.
+          </p>
+          <div style="text-align: center;">
+            <a href="${signupLink}" style="display: inline-block; padding: 14px 32px; background: linear-gradient(135deg, #c9a84c, #e2c460); color: #0d1b2a; font-weight: 600; font-size: 15px; text-decoration: none; border-radius: 8px;">
+              Accept Invitation \u2192
+            </a>
+          </div>
+          <p style="color: rgba(122,147,174,0.5); font-size: 12px; text-align: center; margin: 20px 0 0;">
+            This invitation expires in 7 days.
+          </p>
+        </div>
+      </div>
+      <div style="padding: 16px 32px; text-align: center; border-top: 1px solid rgba(201,168,76,0.08);">
+        <p style="color: rgba(122,147,174,0.4); font-size: 11px; margin: 0;">
+          \u00a9 2026 ReNewIQ \u00b7 Contract Intelligence Platform
+        </p>
+      </div>
+    </div>`;
+
+    const resendRes = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + resendKey,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         from: fromEmail,
         to: [email],
-        subject: sender + ' invited you to join ReNewIQ',
-        html: htmlBody
+        subject: `${sender} invited you to ReNewIQ`,
+        html: emailHtml
       })
     });
 
-    const result = await res.json();
+    const resendData = await resendRes.json();
 
-    if (!res.ok) {
+    if (!resendRes.ok) {
       return {
-        statusCode: res.status,
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: result.message || 'Failed to send invite email', detail: result })
+        statusCode: resendRes.status,
+        headers,
+        body: JSON.stringify({ error: resendData.message || 'Email send failed' })
       };
     }
 
     return {
       statusCode: 200,
-      headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ success: true, messageId: result.id, email: email })
+      headers,
+      body: JSON.stringify({ success: true, messageId: resendData.id, email })
     };
 
-  } catch (e) {
+  } catch (err) {
     return {
       statusCode: 500,
-      headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ error: e.message })
+      headers,
+      body: JSON.stringify({ error: 'Internal error: ' + err.message })
     };
   }
 };
