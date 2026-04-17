@@ -37,6 +37,63 @@ async function addToFreeAccounts(email) {
   }
 }
 
+
+
+// Add invited user to TEAM_MEMBERS env var for team page
+async function addToTeamMembers(email, name, role, inviterEmail) {
+  try {
+    var apiToken = process.env.NETLIFY_API_TOKEN;
+    var accountSlug = process.env.NETLIFY_ACCOUNT_SLUG;
+    var siteId = process.env.NETLIFY_SITE_ID;
+    var url = 'https://api.netlify.com/api/v1/accounts/' + accountSlug + '/env/TEAM_MEMBERS?site_id=' + siteId;
+    var getResp = await fetch(url, {
+      headers: { 'Authorization': 'Bearer ' + apiToken }
+    });
+    var members = [];
+    if (getResp.ok) {
+      var envData = await getResp.json();
+      if (envData && envData.values && envData.values.length > 0) {
+        try { members = JSON.parse(envData.values[0].value); } catch(e) { members = []; }
+      }
+    }
+    var exists = members.some(function(m) { return m.email && m.email.toLowerCase() === email.toLowerCase(); });
+    if (exists) return;
+    var initials = '';
+    if (name) {
+      initials = name.split(' ').map(function(p) { return p.charAt(0).toUpperCase(); }).join('');
+    } else {
+      initials = email.charAt(0).toUpperCase();
+    }
+    var now = new Date().toISOString().split('T')[0];
+    var domain = email.split('@')[1] || '';
+    members.push({
+      email: email.toLowerCase(),
+      name: name || email.split('@')[0],
+      role: role || 'Member',
+      status: 'Invited',
+      joined: now,
+      initials: initials,
+      invitedBy: inviterEmail || '',
+      domain: domain
+    });
+    var newValue = JSON.stringify(members);
+    await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': 'Bearer ' + apiToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        key: 'TEAM_MEMBERS',
+        scopes: ['builds', 'functions', 'runtime', 'post_processing'],
+        values: [{ context: 'all', value: newValue }]
+      })
+    });
+  } catch(e) {
+    console.error('addToTeamMembers error:', e);
+  }
+}
+
 exports.handler = async (event) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
@@ -86,6 +143,9 @@ exports.handler = async (event) => {
 
     // Auto-whitelist: add invited email to FREE_ACCOUNTS so they bypass the paywall
     await addToFreeAccounts(email);
+
+    // Add to team members list
+    await addToTeamMembers(email, email.split('@')[0], role, inviterEmail);
 
     return { statusCode: 200, headers, body: JSON.stringify({ success: true, messageId: resendData.id, email }) };
   } catch (err) {
