@@ -1,97 +1,5 @@
 const crypto = require('crypto');
-
-// Auto-whitelist: add invited email to FREE_ACCOUNTS env var via Netlify API
-async function addToFreeAccounts(email) {
-  try {
-    const apiToken = process.env.NETLIFY_API_TOKEN;
-    const accountSlug = process.env.NETLIFY_ACCOUNT_SLUG;
-    const siteId = process.env.NETLIFY_SITE_ID;
-    if (!apiToken || !accountSlug || !siteId) return;
-
-    const getResp = await fetch(
-      `https://api.netlify.com/api/v1/accounts/${accountSlug}/env/FREE_ACCOUNTS?site_id=${siteId}`,
-      { headers: { 'Authorization': `Bearer ${apiToken}` } }
-    );
-    if (!getResp.ok) return;
-    const envData = await getResp.json();
-    const currentValue = (envData.values && envData.values[0] && envData.values[0].value) || '';
-
-    const emails = currentValue.split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-    if (emails.includes(email.toLowerCase())) return;
-
-    const newValue = currentValue ? currentValue + ',' + email.toLowerCase() : email.toLowerCase();
-    await fetch(
-      `https://api.netlify.com/api/v1/accounts/${accountSlug}/env/FREE_ACCOUNTS?site_id=${siteId}`,
-      {
-        method: 'PUT',
-        headers: { 'Authorization': `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key: 'FREE_ACCOUNTS',
-          scopes: ['builds', 'functions', 'runtime', 'post_processing'],
-          values: [{ context: 'all', value: newValue }]
-        })
-      }
-    );
-  } catch (e) {
-    console.error('addToFreeAccounts error:', e.message);
-  }
-}
-
-// Add invited user to TEAM_MEMBERS env var so they appear on the team page
-async function addToTeamMembers(email, name, role, inviterEmail) {
-  try {
-    const apiToken = process.env.NETLIFY_API_TOKEN;
-    const accountSlug = process.env.NETLIFY_ACCOUNT_SLUG;
-    const siteId = process.env.NETLIFY_SITE_ID;
-    if (!apiToken || !accountSlug || !siteId) return;
-
-    const getResp = await fetch(
-      `https://api.netlify.com/api/v1/accounts/${accountSlug}/env/TEAM_MEMBERS?site_id=${siteId}`,
-      { headers: { 'Authorization': `Bearer ${apiToken}` } }
-    );
-    if (!getResp.ok) return;
-    const envData = await getResp.json();
-    const currentValue = (envData.values && envData.values[0] && envData.values[0].value) || '[]';
-
-    let members = [];
-    try { members = JSON.parse(currentValue); } catch (e) { members = []; }
-
-    // Check if already exists
-    if (members.some(m => m.email && m.email.toLowerCase() === email.toLowerCase())) return;
-
-    const domain = email.split('@')[1].toLowerCase();
-    const nameParts = name.split(/[\s.]+/);
-    const initials = nameParts.length >= 2
-      ? (nameParts[0][0] + nameParts[nameParts.length - 1][0]).toUpperCase()
-      : name.substring(0, 2).toUpperCase();
-
-    members.push({
-      email: email.toLowerCase(),
-      name: name,
-      role: role || 'manager',
-      status: 'Invited',
-      joined: new Date().toISOString().split('T')[0],
-      initials: initials,
-      invitedBy: inviterEmail.toLowerCase(),
-      domain: domain
-    });
-
-    await fetch(
-      `https://api.netlify.com/api/v1/accounts/${accountSlug}/env/TEAM_MEMBERS?site_id=${siteId}`,
-      {
-        method: 'PUT',
-        headers: { 'Authorization': `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key: 'TEAM_MEMBERS',
-          scopes: ['builds', 'functions', 'runtime', 'post_processing'],
-          values: [{ context: 'all', value: JSON.stringify(members) }]
-        })
-      }
-    );
-  } catch (e) {
-    console.error('addToTeamMembers error:', e.message);
-  }
-}
+const supabase = require('./supabase-client');
 
 exports.handler = async (event) => {
   const headers = {
@@ -100,54 +8,124 @@ exports.handler = async (event) => {
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Content-Type': 'application/json'
   };
+
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers, body: '' };
   if (event.httpMethod !== 'POST') return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
 
   try {
     const { email, role, message, inviterName, inviterEmail } = JSON.parse(event.body);
-    if (!email || !email.includes('@')) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Valid email required' }) };
-    if (!inviterEmail || !inviterEmail.includes('@')) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Inviter email required' }) };
 
-    // SECURITY: Enforce domain matching - inviter and invitee must share same email domain
+    if (!email || !email.includes('@')) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Valid email required' }) };
+    }
+    if (!inviterEmail || !inviterEmail.includes('@')) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Inviter email required' }) };
+    }
+
     const invitedDomain = email.split('@')[1].toLowerCase();
     const inviterDomain = inviterEmail.split('@')[1].toLowerCase();
+
     if (invitedDomain !== inviterDomain) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: `Domain mismatch: invited email must use @${inviterDomain}` }) };
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ error: 'Domain mismatch: invited email must use @' + inviterDomain })
+      };
+    }
+
+    const userEmail = email.toLowerCase();
+
+    const { data: existing } = await supabase
+      .from('team_members')
+      .select('email')
+      .eq('email', userEmail)
+      .maybeSingle();
+
+    if (existing) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'User already a team member' }) };
+    }
+
+    const { data: org } = await supabase
+      .from('organizations')
+      .upsert({ domain: inviterDomain, name: inviterDomain.split('.')[0] }, { onConflict: 'domain' })
+      .select('id')
+      .single();
+
+    const signingKey = process.env.RESEND_API_KEY;
+    let inviteToken = '';
+    if (signingKey) {
+      const payload = {
+        email: userEmail,
+        role: role || 'viewer',
+        inviter: inviterEmail.toLowerCase(),
+        exp: Date.now() + (7 * 24 * 60 * 60 * 1000)
+      };
+      const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+      const signature = crypto.createHmac('sha256', signingKey).update(payloadB64).digest('base64url');
+      inviteToken = payloadB64 + '.' + signature;
+    }
+
+    const nameParts = userEmail.split('@')[0].split(/[\\s._-]+/);
+    const displayName = nameParts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+    const initials = nameParts.length >= 2
+      ? (nameParts[0][0] + nameParts[nameParts.length - 1][0]).toUpperCase()
+      : displayName.substring(0, 2).toUpperCase();
+
+    const { error: insertErr } = await supabase
+      .from('team_members')
+      .insert({
+        org_id: org ? org.id : null,
+        email: userEmail,
+        name: displayName,
+        role: role || 'viewer',
+        status: 'Invited',
+        joined: new Date().toISOString().split('T')[0],
+        initials,
+        invited_by: inviterEmail.toLowerCase(),
+        domain: invitedDomain
+      });
+
+    if (insertErr && insertErr.code !== '23505') {
+      console.error('Insert team member error:', insertErr.message);
     }
 
     const resendKey = process.env.RESEND_API_KEY;
-    if (!resendKey) return { statusCode: 500, headers, body: JSON.stringify({ error: 'Email service not configured' }) };
+    if (!resendKey) {
+      return { statusCode: 200, headers, body: JSON.stringify({ success: true, email: userEmail, note: 'No email API key' }) };
+    }
 
-    const fromEmail = process.env.RESEND_FROM_EMAIL || 'ReNewIQ <noreply@renewiq.io>';
-    const roleName = { viewer: 'Viewer', editor: 'Editor', manager: 'Manager', admin: 'Admin' }[role] || 'Manager';
-    const sender = inviterName || 'Your team';
+    const inviteLink = 'https://renewiq.io/app?invite=' + inviteToken;
+    const emailBody = '<div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto;padding:40px 20px">'
+      + '<div style="text-align:center;margin-bottom:30px">'
+      + '<h1 style="color:#c9a84c;font-size:28px;margin:0">ReNewIQ</h1>'
+      + '<p style="color:#888;margin-top:5px">Contract Intelligence Platform</p></div>'
+      + '<div style="background:#1a1a2e;border:1px solid rgba(201,168,76,0.3);border-radius:12px;padding:30px;color:#e0e0e0">'
+      + '<h2 style="color:#c9a84c;margin-top:0">You are Invited!</h2>'
+      + '<p><strong>' + (inviterName || inviterEmail) + '</strong> has invited you to join their team on ReNewIQ as a <strong>' + (role || 'viewer') + '</strong>.</p>'
+      + (message ? '<p style="background:rgba(201,168,76,0.1);padding:15px;border-radius:8px;border-left:3px solid #c9a84c">"' + message + '"</p>' : '')
+      + '<div style="text-align:center;margin:30px 0">'
+      + '<a href="' + inviteLink + '" style="background:linear-gradient(135deg,#c9a84c,#b8943f);color:#1a1a2e;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px">Accept Invitation</a></div>'
+      + '<p style="color:#888;font-size:13px">This invitation expires in 7 days.</p>'
+      + '</div></div>';
 
-    const inviteData = {
-      email: email.toLowerCase(), role: role || 'manager', domain: inviterDomain,
-      inviterEmail: inviterEmail.toLowerCase(), exp: Date.now() + (7 * 24 * 60 * 60 * 1000)
-    };
-    const payload = Buffer.from(JSON.stringify(inviteData)).toString('base64url');
-    const sig = crypto.createHmac('sha256', resendKey).update(payload).digest('base64url');
-    const token = payload + '.' + sig;
-    const signupLink = `https://renewiq.io/?invite=${encodeURIComponent(token)}`;
-
-    const emailHtml = `<div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#0d1b2a;border-radius:12px;overflow:hidden"><div style="padding:40px 32px 24px;text-align:center"><div style="font-size:28px;font-weight:700;color:#c9a84c;font-family:'Georgia',serif">ReNew<span style="color:rgba(122,147,174,0.6)">IQ</span></div><div style="color:rgba(122,147,174,0.5);font-size:10px;letter-spacing:3px;text-transform:uppercase;margin-top:4px">Contract Intelligence Platform</div></div><div style="padding:0 32px 32px"><div style="background:#1a3352;border-radius:8px;padding:32px;border:1px solid rgba(201,168,76,0.15)"><h2 style="color:#f4f7fb;font-size:20px;margin:0 0 16px">You're invited to join ReNewIQ</h2><p style="color:#7a93ae;font-size:15px;line-height:1.6;margin:0 0 16px"><strong style="color:#c9a84c">${sender}</strong> has invited you to join their team on ReNewIQ as a <strong style="color:#f4f7fb">${roleName}</strong>.</p>${message ? `<p style="color:#7a93ae;font-size:14px;line-height:1.5;margin:0 0 16px;padding:12px;background:rgba(201,168,76,0.08);border-radius:6px;border-left:3px solid #c9a84c">"\${message}"</p>` : ''}<p style="color:#7a93ae;font-size:14px;line-height:1.5;margin:0 0 24px">Click below to create your account and get started. Your team subscription covers your access \u2014 no payment needed.</p><div style="text-align:center"><a href="${signupLink}" style="display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#c9a84c,#e2c460);color:#0d1b2a;font-weight:600;font-size:15px;text-decoration:none;border-radius:8px">Accept Invitation \u2192</a></div><p style="color:rgba(122,147,174,0.5);font-size:12px;text-align:center;margin:20px 0 0">This invitation expires in 7 days.</p></div></div><div style="padding:16px 32px;text-align:center;border-top:1px solid rgba(201,168,76,0.08)"><p style="color:rgba(122,147,174,0.4);font-size:11px;margin:0">\u00a9 2026 ReNewIQ \u00b7 Contract Intelligence Platform</p></div></div>`;
-
-    const resendRes = await fetch('https://api.resend.com/emails', {
+    const resendResp = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: fromEmail, to: [email], subject: `${sender} invited you to ReNewIQ`, html: emailHtml })
+      headers: { 'Authorization': 'Bearer ' + resendKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'ReNewIQ <noreply@renewiq.io>',
+        to: [userEmail],
+        subject: (inviterName || 'Your colleague') + ' invited you to ReNewIQ',
+        html: emailBody
+      })
     });
-    const resendData = await resendRes.json();
-    if (!resendRes.ok) return { statusCode: resendRes.status, headers, body: JSON.stringify({ error: resendData.message || 'Email send failed' }) };
 
-    // Auto-whitelist: add invited email to FREE_ACCOUNTS so they bypass the paywall
-    await addToFreeAccounts(email);
+    const resendData = await resendResp.json();
 
-    // Add to TEAM_MEMBERS so they appear on the team page for their domain
-    await addToTeamMembers(email, email.split('@')[0], role, inviterEmail);
-
-    return { statusCode: 200, headers, body: JSON.stringify({ success: true, messageId: resendData.id, email }) };
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({ success: true, messageId: resendData.id, email: userEmail })
+    };
   } catch (err) {
     return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal error: ' + err.message }) };
   }
